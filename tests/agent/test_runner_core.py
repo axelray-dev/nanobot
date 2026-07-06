@@ -188,7 +188,14 @@ async def test_runner_times_out_hung_llm_request():
 
 
 @pytest.mark.asyncio
-async def test_runner_does_not_apply_outer_wall_timeout_to_streaming_requests():
+@pytest.mark.parametrize(
+    ("llm_timeout_s", "expected_timeout_s"),
+    [(0.01, 300.0), (400.0, 800.0)],
+)
+async def test_runner_applies_generous_outer_wall_timeout_to_streaming_requests(
+    llm_timeout_s: float,
+    expected_timeout_s: float,
+):
     from nanobot.agent.hook import AgentHook, AgentHookContext
     from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
@@ -214,24 +221,34 @@ async def test_runner_does_not_apply_outer_wall_timeout_to_streaming_requests():
         async def on_stream(self, context: AgentHookContext, delta: str) -> None:
             streamed.append(delta)
 
-    runner = AgentRunner(provider)
-    wait_for = AsyncMock(side_effect=AssertionError("streaming path must not use wait_for"))
-    with patch("nanobot.agent.runner.asyncio.wait_for", wait_for):
-        result = await runner.run(AgentRunSpec(
-            initial_messages=[{"role": "user", "content": "think for a while"}],
-            tools=tools,
-            model="test-model",
-            max_iterations=1,
-            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
-            hook=StreamingHook(),
-            llm_timeout_s=0.01,
-        ))
+    seen_timeouts: list[float] = []
 
-    assert result.stop_reason == "completed"
-    assert result.final_content == "still alive"
+    async def wait_for(coro, *, timeout):
+        seen_timeouts.append(timeout)
+        return await coro
+
+    runner = AgentRunner(provider)
+    hook = StreamingHook()
+    with patch("nanobot.agent.runner.asyncio.wait_for", wait_for):
+        response = await runner._request_model(
+            AgentRunSpec(
+                initial_messages=[{"role": "user", "content": "think for a while"}],
+                tools=tools,
+                model="test-model",
+                max_iterations=1,
+                max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+                hook=hook,
+                llm_timeout_s=llm_timeout_s,
+            ),
+            [{"role": "user", "content": "think for a while"}],
+            hook,
+            AgentHookContext(iteration=0, messages=[]),
+        )
+
+    assert response.content == "still alive"
     assert streamed == ["still ", "alive"]
     provider.chat_with_retry.assert_not_awaited()
-    wait_for.assert_not_awaited()
+    assert seen_timeouts == [expected_timeout_s]
 
 
 @pytest.mark.asyncio
